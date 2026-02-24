@@ -1,3 +1,3 @@
 pub mod bridge;
 
-pub use bridge::{AsrResult, FluidAudioBridge, SystemInfo};
+pub use bridge::{AsrResult, AsrResultWithTimings, FluidAudioBridge, SystemInfo};

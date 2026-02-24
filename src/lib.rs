@@ -39,6 +39,27 @@ use thiserror::Error;
 // Re-export FFI types
 pub use ffi::{AsrResult, SystemInfo};
 
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct TokenTiming {
+    pub token: String,
+    #[serde(rename = "tokenId")]
+    pub token_id: i32,
+    #[serde(rename = "startTime")]
+    pub start_time: f64,
+    #[serde(rename = "endTime")]
+    pub end_time: f64,
+    pub confidence: f32,
+}
+
+pub struct AsrResultWithTimings {
+    pub text: String,
+    pub confidence: f32,
+    pub duration: f64,
+    pub processing_time: f64,
+    pub rtfx: f32,
+    pub token_timings: Vec<TokenTiming>,
+}
+
 /// Errors that can occur when using FluidAudio
 #[derive(Error, Debug)]
 pub enum FluidAudioError {
@@ -63,6 +84,11 @@ impl From<String> for FluidAudioError {
         FluidAudioError::BridgeError(s)
     }
 }
+
+// SAFETY: FluidAudio wraps a Swift bridge pointer that is only accessed
+// from one thread at a time. The ML worker takes exclusive ownership via
+// take()/put-back pattern — no concurrent access occurs.
+unsafe impl Send for FluidAudio {}
 
 /// Main FluidAudio interface for Rust
 ///
@@ -89,23 +115,38 @@ impl FluidAudio {
         self.bridge.initialize_asr().map_err(FluidAudioError::from)
     }
 
-    /// Transcribe an audio file
-    ///
-    /// # Arguments
-    /// * `path` - Path to the audio file (WAV, M4A, MP3, etc.)
-    ///
-    /// # Returns
-    /// * `AsrResult` containing the transcribed text and metadata
-    pub fn transcribe_file<P: AsRef<Path>>(&self, path: P) -> Result<AsrResult, FluidAudioError> {
+    /// Transcribe an audio file, returning text with word-level token timings.
+    pub fn transcribe_file<P: AsRef<Path>>(
+        &self,
+        path: P,
+    ) -> Result<AsrResultWithTimings, FluidAudioError> {
         let path_str = path.as_ref().to_string_lossy();
 
         if !path.as_ref().exists() {
             return Err(FluidAudioError::FileNotFound(path_str.to_string()));
         }
 
-        self.bridge
+        let raw = self
+            .bridge
             .transcribe_file(&path_str)
-            .map_err(FluidAudioError::from)
+            .map_err(FluidAudioError::from)?;
+
+        parse_result_with_timings(raw)
+    }
+
+    /// Transcribe raw f32 PCM audio samples, returning text with word-level
+    /// token timings.
+    pub fn transcribe_samples(
+        &self,
+        samples: &[f32],
+        sample_rate: u32,
+    ) -> Result<AsrResultWithTimings, FluidAudioError> {
+        let raw = self
+            .bridge
+            .transcribe_samples(samples, sample_rate)
+            .map_err(FluidAudioError::from)?;
+
+        parse_result_with_timings(raw)
     }
 
     /// Check if ASR is initialized and ready
@@ -150,6 +191,27 @@ impl FluidAudio {
     }
 }
 
+fn parse_result_with_timings(
+    raw: ffi::AsrResultWithTimings,
+) -> Result<AsrResultWithTimings, FluidAudioError> {
+    let token_timings: Vec<TokenTiming> = if raw.tokens_json.is_empty() {
+        Vec::new()
+    } else {
+        serde_json::from_str(&raw.tokens_json).map_err(|e| {
+            FluidAudioError::ProcessingFailed(format!("failed to parse token timings JSON: {e}"))
+        })?
+    };
+
+    Ok(AsrResultWithTimings {
+        text: raw.text,
+        confidence: raw.confidence,
+        duration: raw.duration,
+        processing_time: raw.processing_time,
+        rtfx: raw.rtfx,
+        token_timings,
+    })
+}
+
 impl Drop for FluidAudio {
     fn drop(&mut self) {
         self.cleanup();
@@ -165,5 +227,37 @@ mod tests {
         // Note: This test will fail until Swift bridge is properly linked
         // For now, just test the types exist
         let _ = FluidAudioError::NotInitialized("test".to_string());
+    }
+
+    #[test]
+    fn test_parse_token_timings_json() {
+        let json = r#"[
+            {"token": "Hello", "tokenId": 42, "startTime": 0.08, "endTime": 0.32, "confidence": 0.95},
+            {"token": "world", "tokenId": 99, "startTime": 0.40, "endTime": 0.72, "confidence": 0.91}
+        ]"#;
+        let timings: Vec<TokenTiming> = serde_json::from_str(json).unwrap();
+        assert_eq!(timings.len(), 2);
+        assert_eq!(timings[0].token, "Hello");
+        assert_eq!(timings[0].token_id, 42);
+        assert!((timings[0].start_time - 0.08).abs() < 0.001);
+        assert!((timings[0].end_time - 0.32).abs() < 0.001);
+        assert!((timings[0].confidence - 0.95).abs() < 0.001);
+        assert_eq!(timings[1].token, "world");
+        assert_eq!(timings[1].token_id, 99);
+    }
+
+    #[test]
+    fn test_parse_empty_token_timings() {
+        let raw = ffi::AsrResultWithTimings {
+            text: "test".to_string(),
+            confidence: 0.9,
+            duration: 1.0,
+            processing_time: 0.5,
+            rtfx: 2.0,
+            tokens_json: String::new(),
+        };
+        let result = parse_result_with_timings(raw).unwrap();
+        assert!(result.token_timings.is_empty());
+        assert_eq!(result.text, "test");
     }
 }

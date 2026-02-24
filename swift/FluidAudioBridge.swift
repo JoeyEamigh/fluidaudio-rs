@@ -38,7 +38,7 @@ class FluidAudioBridgeInternal {
         }
     }
 
-    func transcribeFile(_ path: String) throws -> (String, Float, Double, Double, Float) {
+    func transcribeFile(_ path: String) throws -> ASRResult {
         guard let manager = asrManager else {
             throw BridgeError.notInitialized
         }
@@ -67,7 +67,38 @@ class FluidAudioBridgeInternal {
             throw BridgeError.noResult
         }
 
-        return (r.text, r.confidence, r.duration, r.processingTime, r.rtfx)
+        return r
+    }
+
+    func transcribeSamples(_ samples: [Float]) throws -> ASRResult {
+        guard let manager = asrManager else {
+            throw BridgeError.notInitialized
+        }
+
+        let semaphore = DispatchSemaphore(value: 0)
+        var result: ASRResult?
+        var transcribeError: Error?
+
+        Task {
+            do {
+                result = try await manager.transcribe(samples, source: .microphone)
+            } catch {
+                transcribeError = error
+            }
+            semaphore.signal()
+        }
+
+        semaphore.wait()
+
+        if let error = transcribeError {
+            throw error
+        }
+
+        guard let r = result else {
+            throw BridgeError.noResult
+        }
+
+        return r
     }
 
     func isAsrAvailable() -> Bool {
@@ -110,6 +141,43 @@ class FluidAudioBridgeInternal {
 enum BridgeError: Error {
     case notInitialized
     case noResult
+}
+
+// MARK: - Token Timing Serialization
+
+/// Serialize token timings from an ASRResult to a JSON C string.
+/// Returns nil if there are no timings.
+private func serializeTokenTimings(_ result: ASRResult) -> UnsafeMutablePointer<CChar>? {
+    guard let timings = result.tokenTimings, !timings.isEmpty else {
+        return nil
+    }
+
+    // TokenTiming is Codable, so we can encode the array directly
+    let encoder = JSONEncoder()
+    guard let jsonData = try? encoder.encode(timings),
+          let jsonString = String(data: jsonData, encoding: .utf8) else {
+        return nil
+    }
+
+    return strdup(jsonString)
+}
+
+/// Write common ASRResult fields into FFI out-parameters.
+private func writeAsrResult(
+    _ result: ASRResult,
+    outText: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?,
+    outConfidence: UnsafeMutablePointer<Float>?,
+    outDuration: UnsafeMutablePointer<Double>?,
+    outProcessingTime: UnsafeMutablePointer<Double>?,
+    outRtfx: UnsafeMutablePointer<Float>?,
+    outTokensJson: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) {
+    outText?.pointee = strdup(result.text)
+    outConfidence?.pointee = result.confidence
+    outDuration?.pointee = result.duration
+    outProcessingTime?.pointee = result.processingTime
+    outRtfx?.pointee = result.rtfx
+    outTokensJson?.pointee = serializeTokenTimings(result)
 }
 
 // MARK: - C FFI Functions
@@ -155,7 +223,8 @@ public func fluidaudio_transcribe_file(
     _ outConfidence: UnsafeMutablePointer<Float>?,
     _ outDuration: UnsafeMutablePointer<Double>?,
     _ outProcessingTime: UnsafeMutablePointer<Double>?,
-    _ outRtfx: UnsafeMutablePointer<Float>?
+    _ outRtfx: UnsafeMutablePointer<Float>?,
+    _ outTokensJson: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
 ) -> Int32 {
     guard let ptr = ptr, let path = path else { return -1 }
     let bridge = Unmanaged<FluidAudioBridgeInternal>.fromOpaque(ptr).takeUnretainedValue()
@@ -163,22 +232,61 @@ public func fluidaudio_transcribe_file(
     let pathString = String(cString: path)
 
     do {
-        let (text, confidence, duration, processingTime, rtfx) = try bridge.transcribeFile(pathString)
-
-        // Allocate and copy text
-        if let outText = outText {
-            let cString = strdup(text)
-            outText.pointee = cString
-        }
-
-        outConfidence?.pointee = confidence
-        outDuration?.pointee = duration
-        outProcessingTime?.pointee = processingTime
-        outRtfx?.pointee = rtfx
-
+        let result = try bridge.transcribeFile(pathString)
+        writeAsrResult(
+            result,
+            outText: outText,
+            outConfidence: outConfidence,
+            outDuration: outDuration,
+            outProcessingTime: outProcessingTime,
+            outRtfx: outRtfx,
+            outTokensJson: outTokensJson
+        )
         return 0
     } catch {
         print("Transcribe error: \(error)")
+        return -1
+    }
+}
+
+@_cdecl("fluidaudio_transcribe_samples")
+public func fluidaudio_transcribe_samples(
+    _ ptr: UnsafeMutableRawPointer?,
+    _ samples: UnsafePointer<Float>?,
+    _ samplesLen: Int,
+    _ sampleRate: Int,
+    _ outText: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?,
+    _ outConfidence: UnsafeMutablePointer<Float>?,
+    _ outDuration: UnsafeMutablePointer<Double>?,
+    _ outProcessingTime: UnsafeMutablePointer<Double>?,
+    _ outRtfx: UnsafeMutablePointer<Float>?,
+    _ outTokensJson: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> Int32 {
+    guard let ptr = ptr, let samples = samples, samplesLen > 0 else { return -1 }
+    let bridge = Unmanaged<FluidAudioBridgeInternal>.fromOpaque(ptr).takeUnretainedValue()
+
+    // Convert raw pointer + length to Swift Array
+    let audioSamples = Array(UnsafeBufferPointer(start: samples, count: samplesLen))
+
+    // If the caller provides a non-16kHz sample rate we would need to resample,
+    // but FluidAudio expects 16kHz. For now, pass through directly — the caller
+    // (Mericordian's capture pipeline) always sends 16kHz mono f32.
+    _ = sampleRate
+
+    do {
+        let result = try bridge.transcribeSamples(audioSamples)
+        writeAsrResult(
+            result,
+            outText: outText,
+            outConfidence: outConfidence,
+            outDuration: outDuration,
+            outProcessingTime: outProcessingTime,
+            outRtfx: outRtfx,
+            outTokensJson: outTokensJson
+        )
+        return 0
+    } catch {
+        print("Transcribe samples error: \(error)")
         return -1
     }
 }

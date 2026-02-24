@@ -19,6 +19,19 @@ extern "C" {
         out_duration: *mut f64,
         out_processing_time: *mut f64,
         out_rtfx: *mut f32,
+        out_tokens_json: *mut *mut i8,
+    ) -> i32;
+    fn fluidaudio_transcribe_samples(
+        bridge: *mut std::ffi::c_void,
+        samples: *const f32,
+        samples_len: isize,
+        sample_rate: isize,
+        out_text: *mut *mut i8,
+        out_confidence: *mut f32,
+        out_duration: *mut f64,
+        out_processing_time: *mut f64,
+        out_rtfx: *mut f32,
+        out_tokens_json: *mut *mut i8,
     ) -> i32;
     fn fluidaudio_is_asr_available(bridge: *mut std::ffi::c_void) -> i32;
 
@@ -40,6 +53,21 @@ extern "C" {
 }
 
 use std::ffi::{CStr, CString};
+
+/// Take ownership of a C string, converting it to a Rust String and freeing
+/// the original. Returns an empty string if the pointer is null.
+///
+/// # Safety
+/// The pointer must have been allocated by `strdup` (or equivalent) on the
+/// Swift side and must not be used after this call.
+unsafe fn take_c_string(ptr: *mut i8) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+    let s = CStr::from_ptr(ptr).to_string_lossy().into_owned();
+    fluidaudio_free_string(ptr);
+    s
+}
 
 /// Safe wrapper for the FluidAudio bridge
 pub struct FluidAudioBridge {
@@ -69,7 +97,7 @@ impl FluidAudioBridge {
         }
     }
 
-    pub fn transcribe_file(&self, path: &str) -> Result<AsrResult, String> {
+    pub fn transcribe_file(&self, path: &str) -> Result<AsrResultWithTimings, String> {
         let c_path = CString::new(path).map_err(|_| "Invalid path")?;
 
         let mut text_ptr: *mut i8 = std::ptr::null_mut();
@@ -77,6 +105,7 @@ impl FluidAudioBridge {
         let mut duration: f64 = 0.0;
         let mut processing_time: f64 = 0.0;
         let mut rtfx: f32 = 0.0;
+        let mut tokens_json_ptr: *mut i8 = std::ptr::null_mut();
 
         let result = unsafe {
             fluidaudio_transcribe_file(
@@ -87,6 +116,7 @@ impl FluidAudioBridge {
                 &mut duration,
                 &mut processing_time,
                 &mut rtfx,
+                &mut tokens_json_ptr,
             )
         };
 
@@ -94,22 +124,60 @@ impl FluidAudioBridge {
             return Err("Transcription failed".to_string());
         }
 
-        let text = if text_ptr.is_null() {
-            String::new()
-        } else {
-            let text = unsafe { CStr::from_ptr(text_ptr) }
-                .to_string_lossy()
-                .into_owned();
-            unsafe { fluidaudio_free_string(text_ptr) };
-            text
-        };
+        let text = unsafe { take_c_string(text_ptr) };
+        let tokens_json = unsafe { take_c_string(tokens_json_ptr) };
 
-        Ok(AsrResult {
+        Ok(AsrResultWithTimings {
             text,
             confidence,
             duration,
             processing_time,
             rtfx,
+            tokens_json,
+        })
+    }
+
+    pub fn transcribe_samples(
+        &self,
+        samples: &[f32],
+        sample_rate: u32,
+    ) -> Result<AsrResultWithTimings, String> {
+        let mut text_ptr: *mut i8 = std::ptr::null_mut();
+        let mut confidence: f32 = 0.0;
+        let mut duration: f64 = 0.0;
+        let mut processing_time: f64 = 0.0;
+        let mut rtfx: f32 = 0.0;
+        let mut tokens_json_ptr: *mut i8 = std::ptr::null_mut();
+
+        let result = unsafe {
+            fluidaudio_transcribe_samples(
+                self.ptr,
+                samples.as_ptr(),
+                samples.len() as isize,
+                sample_rate as isize,
+                &mut text_ptr,
+                &mut confidence,
+                &mut duration,
+                &mut processing_time,
+                &mut rtfx,
+                &mut tokens_json_ptr,
+            )
+        };
+
+        if result != 0 {
+            return Err("Sample transcription failed".to_string());
+        }
+
+        let text = unsafe { take_c_string(text_ptr) };
+        let tokens_json = unsafe { take_c_string(tokens_json_ptr) };
+
+        Ok(AsrResultWithTimings {
+            text,
+            confidence,
+            duration,
+            processing_time,
+            rtfx,
+            tokens_json,
         })
     }
 
@@ -195,6 +263,16 @@ pub struct AsrResult {
     pub duration: f64,
     pub processing_time: f64,
     pub rtfx: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct AsrResultWithTimings {
+    pub text: String,
+    pub confidence: f32,
+    pub duration: f64,
+    pub processing_time: f64,
+    pub rtfx: f32,
+    pub tokens_json: String,
 }
 
 #[derive(Debug, Clone)]
