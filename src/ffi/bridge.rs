@@ -45,6 +45,23 @@ extern "C" {
     fn fluidaudio_get_memory_gb() -> f64;
     fn fluidaudio_is_apple_silicon() -> i32;
 
+    // Diarization
+    fn fluidaudio_initialize_diarizer(bridge: *mut std::ffi::c_void) -> i32;
+    fn fluidaudio_diarize_samples(
+        bridge: *mut std::ffi::c_void,
+        samples: *const f32,
+        samples_len: isize,
+        out_segments_json: *mut *mut i8,
+    ) -> i32;
+    fn fluidaudio_is_diarizer_available(bridge: *mut std::ffi::c_void) -> i32;
+
+    // Model Loading
+    fn fluidaudio_initialize_asr_from_directory(
+        bridge: *mut std::ffi::c_void,
+        model_dir_path: *const i8,
+        version: i32,
+    ) -> i32;
+
     // Cleanup
     fn fluidaudio_cleanup(bridge: *mut std::ffi::c_void);
 
@@ -196,6 +213,50 @@ impl FluidAudioBridge {
 
     pub fn is_vad_available(&self) -> bool {
         unsafe { fluidaudio_is_vad_available(self.ptr) != 0 }
+    }
+
+    pub fn initialize_diarizer(&self) -> Result<(), String> {
+        let result = unsafe { fluidaudio_initialize_diarizer(self.ptr) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err("Failed to initialize diarizer".to_string())
+        }
+    }
+
+    pub fn diarize_samples(&self, samples: &[f32]) -> Result<String, String> {
+        let mut segments_json_ptr: *mut i8 = std::ptr::null_mut();
+
+        let result = unsafe {
+            fluidaudio_diarize_samples(
+                self.ptr,
+                samples.as_ptr(),
+                samples.len() as isize,
+                &mut segments_json_ptr,
+            )
+        };
+
+        if result != 0 {
+            return Err("Diarization failed".to_string());
+        }
+
+        let json = unsafe { take_c_string(segments_json_ptr) };
+        Ok(json)
+    }
+
+    pub fn is_diarizer_available(&self) -> bool {
+        unsafe { fluidaudio_is_diarizer_available(self.ptr) != 0 }
+    }
+
+    pub fn initialize_asr_from_directory(&self, path: &str, version: i32) -> Result<(), String> {
+        let c_path = CString::new(path).map_err(|_| "Invalid path")?;
+        let result =
+            unsafe { fluidaudio_initialize_asr_from_directory(self.ptr, c_path.as_ptr(), version) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err("Failed to initialize ASR from directory".to_string())
+        }
     }
 
     pub fn system_info(&self) -> SystemInfo {

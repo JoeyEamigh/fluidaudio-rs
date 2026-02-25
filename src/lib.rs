@@ -60,6 +60,16 @@ pub struct AsrResultWithTimings {
     pub token_timings: Vec<TokenTiming>,
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct DiarizationSegment {
+    #[serde(rename = "speakerId")]
+    pub speaker_id: String,
+    #[serde(rename = "startTimeSeconds")]
+    pub start_time: f64,
+    #[serde(rename = "endTimeSeconds")]
+    pub end_time: f64,
+}
+
 /// Errors that can occur when using FluidAudio
 #[derive(Error, Debug)]
 pub enum FluidAudioError {
@@ -171,6 +181,62 @@ impl FluidAudio {
         self.bridge.is_vad_available()
     }
 
+    // ========== Diarization Methods ==========
+
+    /// Initialize the diarization engine
+    ///
+    /// Downloads and loads diarization models. First run may take time
+    /// as models are downloaded from HuggingFace and compiled.
+    pub fn init_diarizer(&self) -> Result<(), FluidAudioError> {
+        self.bridge
+            .initialize_diarizer()
+            .map_err(FluidAudioError::from)
+    }
+
+    /// Diarize raw f32 PCM audio samples (16kHz mono)
+    ///
+    /// Returns a list of segments, each with a speaker ID and time range.
+    pub fn diarize_samples(
+        &self,
+        samples: &[f32],
+    ) -> Result<Vec<DiarizationSegment>, FluidAudioError> {
+        let json = self
+            .bridge
+            .diarize_samples(samples)
+            .map_err(FluidAudioError::from)?;
+
+        if json.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        serde_json::from_str(&json).map_err(|e| {
+            FluidAudioError::ProcessingFailed(format!("failed to parse diarization JSON: {e}"))
+        })
+    }
+
+    /// Check if diarizer is initialized and ready
+    pub fn is_diarizer_available(&self) -> bool {
+        self.bridge.is_diarizer_available()
+    }
+
+    // ========== Model Loading Methods ==========
+
+    /// Initialize ASR from a local model directory
+    ///
+    /// # Arguments
+    /// * `path` - Path to directory containing CoreML model bundles and vocab
+    /// * `version` - Model version (2 for v2, 3 for v3)
+    pub fn init_asr_from_directory(
+        &self,
+        path: &Path,
+        version: u32,
+    ) -> Result<(), FluidAudioError> {
+        let path_str = path.to_string_lossy();
+        self.bridge
+            .initialize_asr_from_directory(&path_str, version as i32)
+            .map_err(FluidAudioError::from)
+    }
+
     // ========== System Info ==========
 
     /// Get system information
@@ -244,6 +310,22 @@ mod tests {
         assert!((timings[0].confidence - 0.95).abs() < 0.001);
         assert_eq!(timings[1].token, "world");
         assert_eq!(timings[1].token_id, 99);
+    }
+
+    #[test]
+    fn test_parse_diarization_segments_json() {
+        let json = r#"[
+            {"speakerId": "speaker_0", "startTimeSeconds": 0.0, "endTimeSeconds": 2.5},
+            {"speakerId": "speaker_1", "startTimeSeconds": 2.8, "endTimeSeconds": 5.1}
+        ]"#;
+        let segments: Vec<DiarizationSegment> = serde_json::from_str(json).unwrap();
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].speaker_id, "speaker_0");
+        assert!((segments[0].start_time - 0.0).abs() < 0.001);
+        assert!((segments[0].end_time - 2.5).abs() < 0.001);
+        assert_eq!(segments[1].speaker_id, "speaker_1");
+        assert!((segments[1].start_time - 2.8).abs() < 0.001);
+        assert!((segments[1].end_time - 5.1).abs() < 0.001);
     }
 
     #[test]

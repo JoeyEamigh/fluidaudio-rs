@@ -10,6 +10,7 @@ class FluidAudioBridgeInternal {
     private var asrManager: AsrManager?
     private var asrModels: AsrModels?
     private var vadManager: VadManager?
+    private var diarizerManager: OfflineDiarizerManager?
 
     init() {}
 
@@ -131,10 +132,120 @@ class FluidAudioBridgeInternal {
         return vadManager != nil
     }
 
+    func initializeDiarizer() throws {
+        let semaphore = DispatchSemaphore(value: 0)
+        var initError: Error?
+
+        Task {
+            do {
+                let config = OfflineDiarizerConfig()
+                let manager = OfflineDiarizerManager(config: config)
+                try await manager.prepareModels()
+                self.diarizerManager = manager
+            } catch {
+                initError = error
+            }
+            semaphore.signal()
+        }
+
+        semaphore.wait()
+
+        if let error = initError {
+            throw error
+        }
+    }
+
+    func diarizeSamples(_ samples: [Float]) throws -> String {
+        guard let manager = diarizerManager else {
+            throw BridgeError.notInitialized
+        }
+
+        let semaphore = DispatchSemaphore(value: 0)
+        var result: DiarizationResult?
+        var diarizeError: Error?
+
+        Task {
+            do {
+                result = try await manager.process(audio: samples)
+            } catch {
+                diarizeError = error
+            }
+            semaphore.signal()
+        }
+
+        semaphore.wait()
+
+        if let error = diarizeError {
+            throw error
+        }
+
+        guard let r = result else {
+            throw BridgeError.noResult
+        }
+
+        // Serialize segments to JSON
+        let segments = r.segments.map { seg -> [String: Any] in
+            return [
+                "speakerId": seg.speakerId,
+                "startTimeSeconds": seg.startTimeSeconds,
+                "endTimeSeconds": seg.endTimeSeconds
+            ]
+        }
+
+        let jsonData = try JSONSerialization.data(withJSONObject: segments)
+        guard let jsonString = String(data: jsonData, encoding: .utf8) else {
+            throw BridgeError.noResult
+        }
+
+        return jsonString
+    }
+
+    func isDiarizerAvailable() -> Bool {
+        return diarizerManager != nil
+    }
+
+    func initializeAsrFromDirectory(_ path: String, version: Int32) throws {
+        let semaphore = DispatchSemaphore(value: 0)
+        var initError: Error?
+
+        Task {
+            do {
+                let url = URL(fileURLWithPath: path)
+                let asrVersion: AsrModelVersion
+                switch version {
+                case 2:
+                    asrVersion = .v2
+                case 3:
+                    asrVersion = .v3
+                default:
+                    asrVersion = .v3
+                }
+
+                let config = AsrModels.defaultConfiguration()
+                let models = try await AsrModels.load(from: url, configuration: config, version: asrVersion)
+                self.asrModels = models
+
+                let manager = AsrManager()
+                try await manager.initialize(models: models)
+                self.asrManager = manager
+            } catch {
+                initError = error
+            }
+            semaphore.signal()
+        }
+
+        semaphore.wait()
+
+        if let error = initError {
+            throw error
+        }
+    }
+
     func cleanup() {
         asrManager = nil
         asrModels = nil
         vadManager = nil
+        diarizerManager = nil
     }
 }
 
@@ -355,6 +466,73 @@ public func fluidaudio_get_memory_gb() -> Double {
 public func fluidaudio_is_apple_silicon() -> Int32 {
     return SystemInfo.isAppleSilicon ? 1 : 0
 }
+
+// MARK: - Diarization FFI
+
+@_cdecl("fluidaudio_initialize_diarizer")
+public func fluidaudio_initialize_diarizer(_ ptr: UnsafeMutableRawPointer?) -> Int32 {
+    guard let ptr = ptr else { return -1 }
+    let bridge = Unmanaged<FluidAudioBridgeInternal>.fromOpaque(ptr).takeUnretainedValue()
+    do {
+        try bridge.initializeDiarizer()
+        return 0
+    } catch {
+        print("Diarizer init error: \(error)")
+        return -1
+    }
+}
+
+@_cdecl("fluidaudio_diarize_samples")
+public func fluidaudio_diarize_samples(
+    _ ptr: UnsafeMutableRawPointer?,
+    _ samples: UnsafePointer<Float>?,
+    _ samplesLen: Int,
+    _ outSegmentsJson: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> Int32 {
+    guard let ptr = ptr, let samples = samples, samplesLen > 0 else { return -1 }
+    let bridge = Unmanaged<FluidAudioBridgeInternal>.fromOpaque(ptr).takeUnretainedValue()
+
+    let audioSamples = Array(UnsafeBufferPointer(start: samples, count: samplesLen))
+
+    do {
+        let json = try bridge.diarizeSamples(audioSamples)
+        outSegmentsJson?.pointee = strdup(json)
+        return 0
+    } catch {
+        print("Diarize error: \(error)")
+        return -1
+    }
+}
+
+@_cdecl("fluidaudio_is_diarizer_available")
+public func fluidaudio_is_diarizer_available(_ ptr: UnsafeMutableRawPointer?) -> Int32 {
+    guard let ptr = ptr else { return 0 }
+    let bridge = Unmanaged<FluidAudioBridgeInternal>.fromOpaque(ptr).takeUnretainedValue()
+    return bridge.isDiarizerAvailable() ? 1 : 0
+}
+
+// MARK: - Model Loading FFI
+
+@_cdecl("fluidaudio_initialize_asr_from_directory")
+public func fluidaudio_initialize_asr_from_directory(
+    _ ptr: UnsafeMutableRawPointer?,
+    _ modelDirPath: UnsafePointer<CChar>?,
+    _ version: Int32
+) -> Int32 {
+    guard let ptr = ptr, let modelDirPath = modelDirPath else { return -1 }
+    let bridge = Unmanaged<FluidAudioBridgeInternal>.fromOpaque(ptr).takeUnretainedValue()
+    let path = String(cString: modelDirPath)
+
+    do {
+        try bridge.initializeAsrFromDirectory(path, version: version)
+        return 0
+    } catch {
+        print("ASR from directory init error: \(error)")
+        return -1
+    }
+}
+
+// MARK: - Cleanup
 
 @_cdecl("fluidaudio_cleanup")
 public func fluidaudio_cleanup(_ ptr: UnsafeMutableRawPointer?) {
