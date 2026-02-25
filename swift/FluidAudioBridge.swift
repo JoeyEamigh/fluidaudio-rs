@@ -252,6 +252,14 @@ class FluidAudioBridgeInternal {
     }
 
     private func serializeDiarizationResult(_ r: DiarizationResult) throws -> String {
+        #if FLUIDAUDIO_EMBEDDING
+        return try serializeDiarizationResultWithEmbeddings(r)
+        #else
+        return try serializeDiarizationResultBasic(r)
+        #endif
+    }
+
+    private func serializeDiarizationResultBasic(_ r: DiarizationResult) throws -> String {
         let segments = r.segments.map { seg -> [String: Any] in
             return [
                 "speakerId": seg.speakerId,
@@ -261,6 +269,42 @@ class FluidAudioBridgeInternal {
         }
 
         let jsonData = try JSONSerialization.data(withJSONObject: segments)
+        guard let jsonString = String(data: jsonData, encoding: .utf8) else {
+            throw BridgeError.noResult
+        }
+
+        return jsonString
+    }
+
+    private func serializeDiarizationResultWithEmbeddings(_ r: DiarizationResult) throws -> String {
+        var segments: [[String: Any]] = []
+        segments.reserveCapacity(r.segments.count)
+
+        for seg in r.segments {
+            var dict: [String: Any] = [
+                "speakerId": seg.speakerId,
+                "startTimeSeconds": seg.startTimeSeconds,
+                "endTimeSeconds": seg.endTimeSeconds
+            ]
+
+            if !seg.embedding.isEmpty {
+                dict["embedding"] = seg.embedding
+            }
+
+            segments.append(dict)
+        }
+
+        var root: [String: Any] = ["segments": segments]
+
+        if let speakerDB = r.speakerDatabase {
+            var dbDict: [String: Any] = [:]
+            for (speakerId, centroid) in speakerDB {
+                dbDict[speakerId] = centroid
+            }
+            root["speakerDatabase"] = dbDict
+        }
+
+        let jsonData = try JSONSerialization.data(withJSONObject: root)
         guard let jsonString = String(data: jsonData, encoding: .utf8) else {
             throw BridgeError.noResult
         }

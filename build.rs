@@ -16,14 +16,26 @@ fn main() {
     std::fs::create_dir_all(&swift_build_dir).expect("Failed to create swift-build directory");
 
     // Build Swift package in release mode
+    let mut swift_args = vec![
+        "build".to_string(),
+        "-c".to_string(),
+        "release".to_string(),
+        "--build-path".to_string(),
+        swift_build_dir.to_str().unwrap().to_string(),
+    ];
+
+    if std::env::var("CARGO_FEATURE_EMBEDDING").is_ok() {
+        swift_args.push("-Xswiftc".to_string());
+        swift_args.push("-DFLUIDAUDIO_EMBEDDING".to_string());
+    }
+
+    if std::env::var("CARGO_FEATURE_COREML_EMBEDDING").is_ok() {
+        swift_args.push("-Xswiftc".to_string());
+        swift_args.push("-DCOREML_EMBEDDING".to_string());
+    }
+
     let status = Command::new("swift")
-        .args(&[
-            "build",
-            "-c",
-            "release",
-            "--build-path",
-            swift_build_dir.to_str().unwrap(),
-        ])
+        .args(&swift_args)
         .current_dir(&manifest_dir)
         .status()
         .expect("Failed to run swift build");

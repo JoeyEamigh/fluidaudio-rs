@@ -33,6 +33,7 @@
 
 mod ffi;
 
+use std::collections::HashMap;
 use std::path::Path;
 use thiserror::Error;
 
@@ -68,6 +69,13 @@ pub struct DiarizationSegment {
     pub start_time: f64,
     #[serde(rename = "endTimeSeconds")]
     pub end_time: f64,
+    #[serde(default)]
+    pub embedding: Option<Vec<f32>>,
+}
+
+pub struct DiarizationResult {
+    pub segments: Vec<DiarizationSegment>,
+    pub speaker_embeddings: Option<HashMap<String, Vec<f32>>>,
 }
 
 pub struct DiarizationConfig {
@@ -211,12 +219,14 @@ impl FluidAudio {
 
     /// Diarize raw f32 PCM audio samples (16kHz mono)
     ///
-    /// Returns a list of segments, each with a speaker ID and time range.
+    /// Returns a `DiarizationResult` with segments (each with speaker ID and time
+    /// range). When the `embedding` feature is enabled, per-segment embeddings and
+    /// a speaker-to-centroid database are also included.
     /// Uses default config (clustering threshold 0.7).
     pub fn diarize_samples(
         &self,
         samples: &[f32],
-    ) -> Result<Vec<DiarizationSegment>, FluidAudioError> {
+    ) -> Result<DiarizationResult, FluidAudioError> {
         self.diarize_samples_with_config(samples, DiarizationConfig::default())
     }
 
@@ -228,7 +238,7 @@ impl FluidAudio {
         &self,
         samples: &[f32],
         config: DiarizationConfig,
-    ) -> Result<Vec<DiarizationSegment>, FluidAudioError> {
+    ) -> Result<DiarizationResult, FluidAudioError> {
         let threshold = config.clustering_threshold.unwrap_or(-1.0);
         let min_speakers = config
             .min_speakers
@@ -245,12 +255,13 @@ impl FluidAudio {
             .map_err(FluidAudioError::from)?;
 
         if json.is_empty() {
-            return Ok(Vec::new());
+            return Ok(DiarizationResult {
+                segments: Vec::new(),
+                speaker_embeddings: None,
+            });
         }
 
-        serde_json::from_str(&json).map_err(|e| {
-            FluidAudioError::ProcessingFailed(format!("failed to parse diarization JSON: {e}"))
-        })
+        parse_diarization_json(&json)
     }
 
     /// Check if diarizer is initialized and ready
@@ -296,6 +307,35 @@ impl FluidAudio {
     }
 }
 
+#[cfg(not(feature = "embedding"))]
+fn parse_diarization_json(json: &str) -> Result<DiarizationResult, FluidAudioError> {
+    let segments: Vec<DiarizationSegment> = serde_json::from_str(json).map_err(|e| {
+        FluidAudioError::ProcessingFailed(format!("failed to parse diarization JSON: {e}"))
+    })?;
+    Ok(DiarizationResult {
+        segments,
+        speaker_embeddings: None,
+    })
+}
+
+#[cfg(feature = "embedding")]
+fn parse_diarization_json(json: &str) -> Result<DiarizationResult, FluidAudioError> {
+    #[derive(serde::Deserialize)]
+    struct RawDiarizationResult {
+        segments: Vec<DiarizationSegment>,
+        #[serde(rename = "speakerDatabase")]
+        speaker_database: Option<HashMap<String, Vec<f32>>>,
+    }
+
+    let raw: RawDiarizationResult = serde_json::from_str(json).map_err(|e| {
+        FluidAudioError::ProcessingFailed(format!("failed to parse diarization JSON: {e}"))
+    })?;
+    Ok(DiarizationResult {
+        segments: raw.segments,
+        speaker_embeddings: raw.speaker_database,
+    })
+}
+
 fn parse_result_with_timings(
     raw: ffi::AsrResultWithTimings,
 ) -> Result<AsrResultWithTimings, FluidAudioError> {
@@ -322,6 +362,125 @@ impl Drop for FluidAudio {
         self.cleanup();
     }
 }
+
+// MARK: - CoreML Embedding Bridge
+
+#[cfg(feature = "coreml-embedding")]
+mod coreml_embedding {
+    use std::ffi::{c_void, CString};
+    use std::path::Path;
+
+    use crate::FluidAudioError;
+
+    #[link(name = "FluidAudioBridge")]
+    extern "C" {
+        fn coreml_load_model(path: *const i8, compute_units: i32) -> *mut c_void;
+        fn coreml_predict_embedding(
+            model: *mut c_void,
+            feats: *const f32,
+            num_frames: i32,
+            feat_dim: i32,
+            out_embedding: *mut f32,
+            embedding_dim: i32,
+        ) -> i32;
+        fn coreml_free_model(model: *mut c_void);
+    }
+
+    pub struct CoreMlEmbedder {
+        handle: *mut c_void,
+    }
+
+    // SAFETY: The CoreML model handle is only accessed through &self/&mut self
+    // methods. The ML worker takes exclusive ownership via take/put-back pattern
+    // — no concurrent access occurs.
+    unsafe impl Send for CoreMlEmbedder {}
+    unsafe impl Sync for CoreMlEmbedder {}
+
+    impl CoreMlEmbedder {
+        /// Load a compiled CoreML model (`.mlmodelc`) for speaker embedding extraction.
+        ///
+        /// `use_neural_engine`: if true, uses CPU + Neural Engine; otherwise CPU only.
+        pub fn load(model_path: &Path, use_neural_engine: bool) -> Result<Self, FluidAudioError> {
+            let path_str = model_path.to_string_lossy();
+            let c_path = CString::new(path_str.as_ref()).map_err(|_| {
+                FluidAudioError::BridgeError(format!("invalid path: {path_str}"))
+            })?;
+            let compute_units: i32 = if use_neural_engine { 1 } else { 0 };
+            let handle = unsafe { coreml_load_model(c_path.as_ptr(), compute_units) };
+            if handle.is_null() {
+                return Err(FluidAudioError::BridgeError(format!(
+                    "failed to load CoreML model: {path_str}"
+                )));
+            }
+            Ok(Self { handle })
+        }
+
+        /// Extract a 256-dim speaker embedding from fbank features.
+        ///
+        /// `fbank_features`: flat `[f32]` of shape `[num_frames, 80]` (80-dim fbank).
+        /// `num_frames`: number of time frames in the feature matrix.
+        pub fn extract_embedding(
+            &self,
+            fbank_features: &[f32],
+            num_frames: usize,
+        ) -> Result<[f32; 256], FluidAudioError> {
+            const FEAT_DIM: usize = 80;
+            const EMBEDDING_DIM: usize = 256;
+
+            if fbank_features.len() != num_frames * FEAT_DIM {
+                return Err(FluidAudioError::ProcessingFailed(format!(
+                    "expected {} floats ({}x{}), got {}",
+                    num_frames * FEAT_DIM,
+                    num_frames,
+                    FEAT_DIM,
+                    fbank_features.len()
+                )));
+            }
+
+            let mut embedding = [0.0f32; EMBEDDING_DIM];
+            let rc = unsafe {
+                coreml_predict_embedding(
+                    self.handle,
+                    fbank_features.as_ptr(),
+                    num_frames as i32,
+                    FEAT_DIM as i32,
+                    embedding.as_mut_ptr(),
+                    EMBEDDING_DIM as i32,
+                )
+            };
+
+            match rc {
+                0 => Ok(embedding),
+                -1 => Err(FluidAudioError::BridgeError(
+                    "CoreML: failed to create input MLMultiArray".to_string(),
+                )),
+                -2 => Err(FluidAudioError::BridgeError(
+                    "CoreML: failed to create feature provider".to_string(),
+                )),
+                -3 => Err(FluidAudioError::BridgeError(
+                    "CoreML: model prediction failed".to_string(),
+                )),
+                -4 => Err(FluidAudioError::BridgeError(
+                    "CoreML: output embedding not found".to_string(),
+                )),
+                code => Err(FluidAudioError::BridgeError(format!(
+                    "CoreML: unknown error code {code}"
+                ))),
+            }
+        }
+    }
+
+    impl Drop for CoreMlEmbedder {
+        fn drop(&mut self) {
+            if !self.handle.is_null() {
+                unsafe { coreml_free_model(self.handle) }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "coreml-embedding")]
+pub use coreml_embedding::CoreMlEmbedder;
 
 #[cfg(test)]
 mod tests {
@@ -362,9 +521,54 @@ mod tests {
         assert_eq!(segments[0].speaker_id, "speaker_0");
         assert!((segments[0].start_time - 0.0).abs() < 0.001);
         assert!((segments[0].end_time - 2.5).abs() < 0.001);
+        assert!(segments[0].embedding.is_none());
         assert_eq!(segments[1].speaker_id, "speaker_1");
         assert!((segments[1].start_time - 2.8).abs() < 0.001);
         assert!((segments[1].end_time - 5.1).abs() < 0.001);
+        assert!(segments[1].embedding.is_none());
+    }
+
+    #[test]
+    fn test_parse_diarization_segments_with_embedding() {
+        let json = r#"[
+            {"speakerId": "speaker_0", "startTimeSeconds": 0.0, "endTimeSeconds": 2.5, "embedding": [0.1, 0.2, 0.3]},
+            {"speakerId": "speaker_1", "startTimeSeconds": 2.8, "endTimeSeconds": 5.1}
+        ]"#;
+        let segments: Vec<DiarizationSegment> = serde_json::from_str(json).unwrap();
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].embedding.as_ref().unwrap().len(), 3);
+        assert!((segments[0].embedding.as_ref().unwrap()[0] - 0.1).abs() < 0.001);
+        assert!(segments[1].embedding.is_none());
+    }
+
+    #[cfg(not(feature = "embedding"))]
+    #[test]
+    fn test_parse_diarization_result_basic() {
+        let json = r#"[
+            {"speakerId": "speaker_0", "startTimeSeconds": 0.0, "endTimeSeconds": 2.5}
+        ]"#;
+        let result = parse_diarization_json(json).unwrap();
+        assert_eq!(result.segments.len(), 1);
+        assert!(result.speaker_embeddings.is_none());
+    }
+
+    #[cfg(feature = "embedding")]
+    #[test]
+    fn test_parse_diarization_result_with_embeddings() {
+        let json = r#"{
+            "segments": [
+                {"speakerId": "speaker_0", "startTimeSeconds": 0.0, "endTimeSeconds": 2.5, "embedding": [0.1, 0.2, 0.3]}
+            ],
+            "speakerDatabase": {
+                "speaker_0": [0.15, 0.25, 0.35]
+            }
+        }"#;
+        let result = parse_diarization_json(json).unwrap();
+        assert_eq!(result.segments.len(), 1);
+        assert_eq!(result.segments[0].embedding.as_ref().unwrap().len(), 3);
+        let db = result.speaker_embeddings.unwrap();
+        assert_eq!(db.len(), 1);
+        assert_eq!(db["speaker_0"].len(), 3);
     }
 
     #[test]
