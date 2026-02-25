@@ -11,11 +11,6 @@ extern "C" {
 
     // ASR
     fn fluidaudio_initialize_asr(bridge: *mut std::ffi::c_void) -> i32;
-    fn fluidaudio_initialize_asr_from_directory(
-        bridge: *mut std::ffi::c_void,
-        path: *const i8,
-        version: i32,
-    ) -> i32;
     fn fluidaudio_transcribe_file(
         bridge: *mut std::ffi::c_void,
         path: *const i8,
@@ -116,21 +111,6 @@ impl FluidAudioBridge {
             Ok(())
         } else {
             Err("Failed to initialize ASR".to_string())
-        }
-    }
-
-    pub fn initialize_asr_from_directory(
-        &self,
-        path: &CStr,
-        version: i32,
-    ) -> Result<(), String> {
-        let result = unsafe {
-            fluidaudio_initialize_asr_from_directory(self.ptr, path.as_ptr(), version)
-        };
-        if result == 0 {
-            Ok(())
-        } else {
-            Err("Failed to initialize ASR from directory".to_string())
         }
     }
 

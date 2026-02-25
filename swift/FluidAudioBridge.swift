@@ -39,47 +39,6 @@ class FluidAudioBridgeInternal {
         }
     }
 
-    func initializeAsrFromDirectory(_ path: String, version: Int) throws {
-        let semaphore = DispatchSemaphore(value: 0)
-        var initError: Error?
-
-        Task {
-            do {
-                let url = URL(fileURLWithPath: path, isDirectory: true)
-
-                let ver: AsrModelVersion
-                switch version {
-                case 2:
-                    ver = .v2
-                case 3:
-                    ver = .v3
-                default:
-                    throw BridgeError.invalidVersion
-                }
-
-                let models = try await AsrModels.load(
-                    from: url,
-                    configuration: AsrModels.defaultConfiguration(),
-                    version: ver
-                )
-                self.asrModels = models
-
-                let manager = AsrManager()
-                try await manager.initialize(models: models)
-                self.asrManager = manager
-            } catch {
-                initError = error
-            }
-            semaphore.signal()
-        }
-
-        semaphore.wait()
-
-        if let error = initError {
-            throw error
-        }
-    }
-
     func transcribeFile(_ path: String) throws -> ASRResult {
         guard let manager = asrManager else {
             throw BridgeError.notInitialized
@@ -364,24 +323,6 @@ public func fluidaudio_initialize_asr(_ ptr: UnsafeMutableRawPointer?) -> Int32 
         return 0
     } catch {
         print("ASR init error: \(error)")
-        return -1
-    }
-}
-
-@_cdecl("fluidaudio_initialize_asr_from_directory")
-public func fluidaudio_initialize_asr_from_directory(
-    _ ptr: UnsafeMutableRawPointer?,
-    _ path: UnsafePointer<CChar>?,
-    _ version: Int32
-) -> Int32 {
-    guard let ptr = ptr, let path = path else { return -1 }
-    let bridge = Unmanaged<FluidAudioBridgeInternal>.fromOpaque(ptr).takeUnretainedValue()
-    let pathString = String(cString: path)
-    do {
-        try bridge.initializeAsrFromDirectory(pathString, version: Int(version))
-        return 0
-    } catch {
-        print("ASR init from directory error: \(error)")
         return -1
     }
 }
