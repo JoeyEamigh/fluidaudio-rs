@@ -125,6 +125,22 @@ impl FluidAudio {
         self.bridge.initialize_asr().map_err(FluidAudioError::from)
     }
 
+    /// Initialize ASR from a local directory containing CoreML model bundles.
+    ///
+    /// The directory must contain `Preprocessor.mlmodelc/`, `Encoder.mlmodelc/`,
+    /// `Decoder.mlmodelc/`, `JointDecision.mlmodelc/`, and `parakeet_vocab.json`.
+    pub fn init_asr_from_directory(
+        &self,
+        path: &Path,
+        version: u32,
+    ) -> Result<(), FluidAudioError> {
+        let c_path = std::ffi::CString::new(path.to_string_lossy().as_ref())
+            .map_err(|_| FluidAudioError::BridgeError("Invalid path".to_string()))?;
+        self.bridge
+            .initialize_asr_from_directory(&c_path, version as i32)
+            .map_err(FluidAudioError::from)
+    }
+
     /// Transcribe an audio file, returning text with word-level token timings.
     pub fn transcribe_file<P: AsRef<Path>>(
         &self,
