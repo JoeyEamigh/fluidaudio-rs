@@ -47,10 +47,13 @@ extern "C" {
 
     // Diarization
     fn fluidaudio_initialize_diarizer(bridge: *mut std::ffi::c_void) -> i32;
-    fn fluidaudio_diarize_samples(
+    fn fluidaudio_diarize_samples_with_config(
         bridge: *mut std::ffi::c_void,
         samples: *const f32,
         samples_len: isize,
+        clustering_threshold: f32,
+        min_speakers: i32,
+        max_speakers: i32,
         out_segments_json: *mut *mut i8,
     ) -> i32;
     fn fluidaudio_is_diarizer_available(bridge: *mut std::ffi::c_void) -> i32;
@@ -224,20 +227,29 @@ impl FluidAudioBridge {
         }
     }
 
-    pub fn diarize_samples(&self, samples: &[f32]) -> Result<String, String> {
+    pub fn diarize_samples_with_config(
+        &self,
+        samples: &[f32],
+        clustering_threshold: f32,
+        min_speakers: i32,
+        max_speakers: i32,
+    ) -> Result<String, String> {
         let mut segments_json_ptr: *mut i8 = std::ptr::null_mut();
 
         let result = unsafe {
-            fluidaudio_diarize_samples(
+            fluidaudio_diarize_samples_with_config(
                 self.ptr,
                 samples.as_ptr(),
                 samples.len() as isize,
+                clustering_threshold,
+                min_speakers,
+                max_speakers,
                 &mut segments_json_ptr,
             )
         };
 
         if result != 0 {
-            return Err("Diarization failed".to_string());
+            return Err("Diarization with config failed".to_string());
         }
 
         let json = unsafe { take_c_string(segments_json_ptr) };

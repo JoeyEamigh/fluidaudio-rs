@@ -138,7 +138,7 @@ class FluidAudioBridgeInternal {
 
         Task {
             do {
-                let config = OfflineDiarizerConfig()
+                let config = OfflineDiarizerConfig(clusteringThreshold: 0.7)
                 let manager = OfflineDiarizerManager(config: config)
                 try await manager.prepareModels()
                 self.diarizerManager = manager
@@ -183,7 +183,75 @@ class FluidAudioBridgeInternal {
             throw BridgeError.noResult
         }
 
-        // Serialize segments to JSON
+        return try serializeDiarizationResult(r)
+    }
+
+    func diarizeSamplesWithConfig(
+        _ samples: [Float],
+        clusteringThreshold: Float,
+        minSpeakers: Int32,
+        maxSpeakers: Int32
+    ) throws -> String {
+        var config = OfflineDiarizerConfig()
+        if clusteringThreshold >= 0 {
+            config.clustering.threshold = Double(clusteringThreshold)
+        } else {
+            config.clustering.threshold = 0.7
+        }
+        if minSpeakers >= 0 {
+            config.clustering.minSpeakers = Int(minSpeakers)
+        }
+        if maxSpeakers >= 0 {
+            config.clustering.maxSpeakers = Int(maxSpeakers)
+        }
+
+        let manager = OfflineDiarizerManager(config: config)
+
+        let semaphore = DispatchSemaphore(value: 0)
+        var prepareError: Error?
+
+        Task {
+            do {
+                try await manager.prepareModels()
+            } catch {
+                prepareError = error
+            }
+            semaphore.signal()
+        }
+
+        semaphore.wait()
+
+        if let error = prepareError {
+            throw error
+        }
+
+        var result: DiarizationResult?
+        var diarizeError: Error?
+        let semaphore2 = DispatchSemaphore(value: 0)
+
+        Task {
+            do {
+                result = try await manager.process(audio: samples)
+            } catch {
+                diarizeError = error
+            }
+            semaphore2.signal()
+        }
+
+        semaphore2.wait()
+
+        if let error = diarizeError {
+            throw error
+        }
+
+        guard let r = result else {
+            throw BridgeError.noResult
+        }
+
+        return try serializeDiarizationResult(r)
+    }
+
+    private func serializeDiarizationResult(_ r: DiarizationResult) throws -> String {
         let segments = r.segments.map { seg -> [String: Any] in
             return [
                 "speakerId": seg.speakerId,
@@ -501,6 +569,36 @@ public func fluidaudio_diarize_samples(
         return 0
     } catch {
         print("Diarize error: \(error)")
+        return -1
+    }
+}
+
+@_cdecl("fluidaudio_diarize_samples_with_config")
+public func fluidaudio_diarize_samples_with_config(
+    _ ptr: UnsafeMutableRawPointer?,
+    _ samples: UnsafePointer<Float>?,
+    _ samplesLen: Int,
+    _ clusteringThreshold: Float,
+    _ minSpeakers: Int32,
+    _ maxSpeakers: Int32,
+    _ outSegmentsJson: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> Int32 {
+    guard let ptr = ptr, let samples = samples, samplesLen > 0 else { return -1 }
+    let bridge = Unmanaged<FluidAudioBridgeInternal>.fromOpaque(ptr).takeUnretainedValue()
+
+    let audioSamples = Array(UnsafeBufferPointer(start: samples, count: samplesLen))
+
+    do {
+        let json = try bridge.diarizeSamplesWithConfig(
+            audioSamples,
+            clusteringThreshold: clusteringThreshold,
+            minSpeakers: minSpeakers,
+            maxSpeakers: maxSpeakers
+        )
+        outSegmentsJson?.pointee = strdup(json)
+        return 0
+    } catch {
+        print("Diarize with config error: \(error)")
         return -1
     }
 }

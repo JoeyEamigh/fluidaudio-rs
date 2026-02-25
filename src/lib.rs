@@ -70,6 +70,22 @@ pub struct DiarizationSegment {
     pub end_time: f64,
 }
 
+pub struct DiarizationConfig {
+    pub clustering_threshold: Option<f32>,
+    pub min_speakers: Option<u32>,
+    pub max_speakers: Option<u32>,
+}
+
+impl Default for DiarizationConfig {
+    fn default() -> Self {
+        Self {
+            clustering_threshold: Some(0.7),
+            min_speakers: None,
+            max_speakers: None,
+        }
+    }
+}
+
 /// Errors that can occur when using FluidAudio
 #[derive(Error, Debug)]
 pub enum FluidAudioError {
@@ -196,13 +212,36 @@ impl FluidAudio {
     /// Diarize raw f32 PCM audio samples (16kHz mono)
     ///
     /// Returns a list of segments, each with a speaker ID and time range.
+    /// Uses default config (clustering threshold 0.7).
     pub fn diarize_samples(
         &self,
         samples: &[f32],
     ) -> Result<Vec<DiarizationSegment>, FluidAudioError> {
+        self.diarize_samples_with_config(samples, DiarizationConfig::default())
+    }
+
+    /// Diarize raw f32 PCM audio samples with explicit configuration.
+    ///
+    /// Use `DiarizationConfig::default()` for standard settings (threshold 0.7).
+    /// Set `min_speakers`/`max_speakers` to constrain speaker count detection.
+    pub fn diarize_samples_with_config(
+        &self,
+        samples: &[f32],
+        config: DiarizationConfig,
+    ) -> Result<Vec<DiarizationSegment>, FluidAudioError> {
+        let threshold = config.clustering_threshold.unwrap_or(-1.0);
+        let min_speakers = config
+            .min_speakers
+            .map(|v| v as i32)
+            .unwrap_or(-1);
+        let max_speakers = config
+            .max_speakers
+            .map(|v| v as i32)
+            .unwrap_or(-1);
+
         let json = self
             .bridge
-            .diarize_samples(samples)
+            .diarize_samples_with_config(samples, threshold, min_speakers, max_speakers)
             .map_err(FluidAudioError::from)?;
 
         if json.is_empty() {
