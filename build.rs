@@ -34,6 +34,11 @@ fn main() {
         swift_args.push("-DCOREML_EMBEDDING".to_string());
     }
 
+    if std::env::var("CARGO_FEATURE_COREML_PREDICTOR").is_ok() {
+        swift_args.push("-Xswiftc".to_string());
+        swift_args.push("-DCOREML_PREDICTOR".to_string());
+    }
+
     let status = Command::new("swift")
         .args(&swift_args)
         .current_dir(&manifest_dir)

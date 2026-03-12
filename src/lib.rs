@@ -482,6 +482,230 @@ mod coreml_embedding {
 #[cfg(feature = "coreml-embedding")]
 pub use coreml_embedding::CoreMlEmbedder;
 
+// MARK: - CoreML Generic Predictor Bridge
+
+#[cfg(feature = "coreml-predictor")]
+mod coreml_predictor {
+    use std::ffi::{c_void, CString};
+    use std::path::Path;
+
+    use crate::FluidAudioError;
+
+    #[link(name = "FluidAudioBridge")]
+    extern "C" {
+        fn coreml_predictor_load(
+            path: *const i8,
+            compute_units: i32,
+            input_name: *const i8,
+            output_name: *const i8,
+        ) -> *mut c_void;
+        fn coreml_predictor_predict(
+            handle: *mut c_void,
+            input_data: *const f32,
+            input_shape: *const i32,
+            input_dims: i32,
+            output_data: *mut f32,
+            output_capacity: i32,
+        ) -> i32;
+        fn coreml_predictor_predict_multi(
+            handle: *mut c_void,
+            num_inputs: i32,
+            input_names: *const *const i8,
+            input_datas: *const *const f32,
+            input_shapes: *const *const i32,
+            input_dims: *const i32,
+            output_data: *mut f32,
+            output_capacity: i32,
+        ) -> i32;
+        fn coreml_predictor_free(handle: *mut c_void);
+    }
+
+    pub struct CoreMlPredictor {
+        handle: *mut c_void,
+    }
+
+    // SAFETY: The CoreML model handle is only accessed through &self/&mut self
+    // methods. The ML worker takes exclusive ownership via take/put-back pattern
+    // — no concurrent access occurs.
+    unsafe impl Send for CoreMlPredictor {}
+    unsafe impl Sync for CoreMlPredictor {}
+
+    impl CoreMlPredictor {
+        /// Load a compiled CoreML model (`.mlmodelc`) for generic tensor inference.
+        ///
+        /// `input_name`: the model's input feature name (e.g. "images").
+        /// `output_name`: the model's output feature name (e.g. "var_1662").
+        /// `use_neural_engine`: if true, uses CPU + Neural Engine; otherwise CPU only.
+        pub fn load(
+            model_path: &Path,
+            input_name: &str,
+            output_name: &str,
+            use_neural_engine: bool,
+        ) -> Result<Self, FluidAudioError> {
+            let path_str = model_path.to_string_lossy();
+            let c_path = CString::new(path_str.as_ref()).map_err(|_| {
+                FluidAudioError::BridgeError(format!("invalid path: {path_str}"))
+            })?;
+            let c_input = CString::new(input_name).map_err(|_| {
+                FluidAudioError::BridgeError(format!("invalid input name: {input_name}"))
+            })?;
+            let c_output = CString::new(output_name).map_err(|_| {
+                FluidAudioError::BridgeError(format!("invalid output name: {output_name}"))
+            })?;
+            let compute_units: i32 = if use_neural_engine { 1 } else { 0 };
+            let handle = unsafe {
+                coreml_predictor_load(
+                    c_path.as_ptr(),
+                    compute_units,
+                    c_input.as_ptr(),
+                    c_output.as_ptr(),
+                )
+            };
+            if handle.is_null() {
+                return Err(FluidAudioError::BridgeError(format!(
+                    "failed to load CoreML model: {path_str}"
+                )));
+            }
+            Ok(Self { handle })
+        }
+
+        /// Run inference with arbitrary shaped f32 input.
+        ///
+        /// `input`: flat f32 data for the input tensor.
+        /// `shape`: dimensions of the input tensor (e.g. `[1, 3, 1024, 1024]`).
+        /// `output_capacity`: maximum number of f32 elements expected in the output.
+        ///
+        /// Returns the output tensor as a flat `Vec<f32>` trimmed to the actual output size.
+        pub fn predict(
+            &self,
+            input: &[f32],
+            shape: &[i32],
+            output_capacity: usize,
+        ) -> Result<Vec<f32>, FluidAudioError> {
+            let mut output = vec![0.0f32; output_capacity];
+            let rc = unsafe {
+                coreml_predictor_predict(
+                    self.handle,
+                    input.as_ptr(),
+                    shape.as_ptr(),
+                    shape.len() as i32,
+                    output.as_mut_ptr(),
+                    output_capacity as i32,
+                )
+            };
+
+            match rc {
+                n if n > 0 => {
+                    output.truncate(n as usize);
+                    Ok(output)
+                }
+                0 => {
+                    output.truncate(0);
+                    Ok(output)
+                }
+                -1 => Err(FluidAudioError::BridgeError(
+                    "CoreML predictor: failed to create input MLMultiArray".to_string(),
+                )),
+                -2 => Err(FluidAudioError::BridgeError(
+                    "CoreML predictor: failed to create feature provider".to_string(),
+                )),
+                -3 => Err(FluidAudioError::BridgeError(
+                    "CoreML predictor: model prediction failed".to_string(),
+                )),
+                -4 => Err(FluidAudioError::BridgeError(
+                    "CoreML predictor: output feature not found".to_string(),
+                )),
+                -5 => Err(FluidAudioError::BridgeError(
+                    "CoreML predictor: output size exceeds capacity".to_string(),
+                )),
+                code => Err(FluidAudioError::BridgeError(format!(
+                    "CoreML predictor: unknown error code {code}"
+                ))),
+            }
+        }
+
+        /// Run inference with multiple named inputs.
+        ///
+        /// Each entry in `inputs` is `(name, data, shape)` where:
+        /// - `name`: the CoreML input feature name
+        /// - `data`: flat f32 data for the input tensor
+        /// - `shape`: dimensions of the input tensor
+        pub fn predict_multi(
+            &self,
+            inputs: &[(&str, &[f32], &[i32])],
+            output_capacity: usize,
+        ) -> Result<Vec<f32>, FluidAudioError> {
+            let c_names: Vec<CString> = inputs
+                .iter()
+                .map(|(name, _, _)| {
+                    CString::new(*name).map_err(|_| {
+                        FluidAudioError::BridgeError(format!("invalid input name: {name}"))
+                    })
+                })
+                .collect::<Result<_, _>>()?;
+
+            let name_ptrs: Vec<*const i8> = c_names.iter().map(|s| s.as_ptr()).collect();
+            let data_ptrs: Vec<*const f32> = inputs.iter().map(|(_, d, _)| d.as_ptr()).collect();
+            let shape_ptrs: Vec<*const i32> = inputs.iter().map(|(_, _, s)| s.as_ptr()).collect();
+            let dims: Vec<i32> = inputs.iter().map(|(_, _, s)| s.len() as i32).collect();
+
+            let mut output = vec![0.0f32; output_capacity];
+            let rc = unsafe {
+                coreml_predictor_predict_multi(
+                    self.handle,
+                    inputs.len() as i32,
+                    name_ptrs.as_ptr(),
+                    data_ptrs.as_ptr(),
+                    shape_ptrs.as_ptr(),
+                    dims.as_ptr(),
+                    output.as_mut_ptr(),
+                    output_capacity as i32,
+                )
+            };
+
+            match rc {
+                n if n > 0 => {
+                    output.truncate(n as usize);
+                    Ok(output)
+                }
+                0 => {
+                    output.truncate(0);
+                    Ok(output)
+                }
+                -1 => Err(FluidAudioError::BridgeError(
+                    "CoreML predictor multi: failed to create input MLMultiArray".to_string(),
+                )),
+                -2 => Err(FluidAudioError::BridgeError(
+                    "CoreML predictor multi: failed to create feature provider".to_string(),
+                )),
+                -3 => Err(FluidAudioError::BridgeError(
+                    "CoreML predictor multi: model prediction failed".to_string(),
+                )),
+                -4 => Err(FluidAudioError::BridgeError(
+                    "CoreML predictor multi: output feature not found".to_string(),
+                )),
+                -5 => Err(FluidAudioError::BridgeError(
+                    "CoreML predictor multi: output size exceeds capacity".to_string(),
+                )),
+                code => Err(FluidAudioError::BridgeError(format!(
+                    "CoreML predictor multi: unknown error code {code}"
+                ))),
+            }
+        }
+    }
+
+    impl Drop for CoreMlPredictor {
+        fn drop(&mut self) {
+            if !self.handle.is_null() {
+                unsafe { coreml_predictor_free(self.handle) }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "coreml-predictor")]
+pub use coreml_predictor::CoreMlPredictor;
+
 #[cfg(test)]
 mod tests {
     use super::*;
