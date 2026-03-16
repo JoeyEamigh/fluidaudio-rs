@@ -268,7 +268,21 @@ class FluidAudioBridgeInternal {
             ]
         }
 
-        let jsonData = try JSONSerialization.data(withJSONObject: segments)
+        var root: [String: Any] = ["segments": segments]
+
+        if let posteriors = r.posteriors,
+           let numFrames = r.posteriorsNumFrames,
+           let numSpeakers = r.posteriorsNumSpeakers,
+           let frameDuration = r.posteriorsFrameDuration,
+           let speakerIds = r.posteriorsSpeakerIds {
+            root["posteriors"] = posteriors
+            root["posteriorsNumFrames"] = numFrames
+            root["posteriorsNumSpeakers"] = numSpeakers
+            root["posteriorsFrameDuration"] = frameDuration
+            root["posteriorsSpeakerIds"] = speakerIds
+        }
+
+        let jsonData = try JSONSerialization.data(withJSONObject: root)
         guard let jsonString = String(data: jsonData, encoding: .utf8) else {
             throw BridgeError.noResult
         }
@@ -302,6 +316,18 @@ class FluidAudioBridgeInternal {
                 dbDict[speakerId] = centroid
             }
             root["speakerDatabase"] = dbDict
+        }
+
+        if let posteriors = r.posteriors,
+           let numFrames = r.posteriorsNumFrames,
+           let numSpeakers = r.posteriorsNumSpeakers,
+           let frameDuration = r.posteriorsFrameDuration,
+           let speakerIds = r.posteriorsSpeakerIds {
+            root["posteriors"] = posteriors
+            root["posteriorsNumFrames"] = numFrames
+            root["posteriorsNumSpeakers"] = numSpeakers
+            root["posteriorsFrameDuration"] = frameDuration
+            root["posteriorsSpeakerIds"] = speakerIds
         }
 
         let jsonData = try JSONSerialization.data(withJSONObject: root)

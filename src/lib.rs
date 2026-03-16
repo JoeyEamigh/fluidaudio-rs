@@ -76,6 +76,12 @@ pub struct DiarizationSegment {
 pub struct DiarizationResult {
     pub segments: Vec<DiarizationSegment>,
     pub speaker_embeddings: Option<HashMap<String, Vec<f32>>>,
+    /// Frame-level soft speaker posteriors, flattened row-major.
+    pub posteriors: Option<Vec<f32>>,
+    pub posteriors_num_frames: Option<usize>,
+    pub posteriors_num_speakers: Option<usize>,
+    pub posteriors_frame_duration: Option<f32>,
+    pub posteriors_speaker_ids: Option<Vec<String>>,
 }
 
 pub struct DiarizationConfig {
@@ -258,6 +264,11 @@ impl FluidAudio {
             return Ok(DiarizationResult {
                 segments: Vec::new(),
                 speaker_embeddings: None,
+                posteriors: None,
+                posteriors_num_frames: None,
+                posteriors_num_speakers: None,
+                posteriors_frame_duration: None,
+                posteriors_speaker_ids: None,
             });
         }
 
@@ -307,24 +318,21 @@ impl FluidAudio {
     }
 }
 
-#[cfg(not(feature = "embedding"))]
-fn parse_diarization_json(json: &str) -> Result<DiarizationResult, FluidAudioError> {
-    let segments: Vec<DiarizationSegment> = serde_json::from_str(json).map_err(|e| {
-        FluidAudioError::ProcessingFailed(format!("failed to parse diarization JSON: {e}"))
-    })?;
-    Ok(DiarizationResult {
-        segments,
-        speaker_embeddings: None,
-    })
-}
-
-#[cfg(feature = "embedding")]
 fn parse_diarization_json(json: &str) -> Result<DiarizationResult, FluidAudioError> {
     #[derive(serde::Deserialize)]
     struct RawDiarizationResult {
         segments: Vec<DiarizationSegment>,
         #[serde(rename = "speakerDatabase")]
         speaker_database: Option<HashMap<String, Vec<f32>>>,
+        posteriors: Option<Vec<f32>>,
+        #[serde(rename = "posteriorsNumFrames")]
+        posteriors_num_frames: Option<usize>,
+        #[serde(rename = "posteriorsNumSpeakers")]
+        posteriors_num_speakers: Option<usize>,
+        #[serde(rename = "posteriorsFrameDuration")]
+        posteriors_frame_duration: Option<f32>,
+        #[serde(rename = "posteriorsSpeakerIds")]
+        posteriors_speaker_ids: Option<Vec<String>>,
     }
 
     let raw: RawDiarizationResult = serde_json::from_str(json).map_err(|e| {
@@ -333,6 +341,11 @@ fn parse_diarization_json(json: &str) -> Result<DiarizationResult, FluidAudioErr
     Ok(DiarizationResult {
         segments: raw.segments,
         speaker_embeddings: raw.speaker_database,
+        posteriors: raw.posteriors,
+        posteriors_num_frames: raw.posteriors_num_frames,
+        posteriors_num_speakers: raw.posteriors_num_speakers,
+        posteriors_frame_duration: raw.posteriors_frame_duration,
+        posteriors_speaker_ids: raw.posteriors_speaker_ids,
     })
 }
 
@@ -765,15 +778,15 @@ mod tests {
         assert!(segments[1].embedding.is_none());
     }
 
-    #[cfg(not(feature = "embedding"))]
     #[test]
     fn test_parse_diarization_result_basic() {
-        let json = r#"[
+        let json = r#"{"segments": [
             {"speakerId": "speaker_0", "startTimeSeconds": 0.0, "endTimeSeconds": 2.5}
-        ]"#;
+        ]}"#;
         let result = parse_diarization_json(json).unwrap();
         assert_eq!(result.segments.len(), 1);
         assert!(result.speaker_embeddings.is_none());
+        assert!(result.posteriors.is_none());
     }
 
     #[cfg(feature = "embedding")]
@@ -793,6 +806,29 @@ mod tests {
         let db = result.speaker_embeddings.unwrap();
         assert_eq!(db.len(), 1);
         assert_eq!(db["speaker_0"].len(), 3);
+    }
+
+    #[test]
+    fn test_parse_diarization_result_with_posteriors() {
+        let json = r#"{
+            "segments": [
+                {"speakerId": "S1", "startTimeSeconds": 0.0, "endTimeSeconds": 2.5}
+            ],
+            "posteriors": [0.9, 0.1, 0.2, 0.8, 0.7, 0.3],
+            "posteriorsNumFrames": 3,
+            "posteriorsNumSpeakers": 2,
+            "posteriorsFrameDuration": 0.02,
+            "posteriorsSpeakerIds": ["S1", "S2"]
+        }"#;
+        let result = parse_diarization_json(json).unwrap();
+        assert_eq!(result.segments.len(), 1);
+        let posteriors = result.posteriors.unwrap();
+        assert_eq!(posteriors.len(), 6);
+        assert!((posteriors[0] - 0.9).abs() < 0.001);
+        assert_eq!(result.posteriors_num_frames.unwrap(), 3);
+        assert_eq!(result.posteriors_num_speakers.unwrap(), 2);
+        assert!((result.posteriors_frame_duration.unwrap() - 0.02).abs() < 0.001);
+        assert_eq!(result.posteriors_speaker_ids.unwrap(), vec!["S1", "S2"]);
     }
 
     #[test]
