@@ -88,6 +88,12 @@ pub struct DiarizationConfig {
     pub clustering_threshold: Option<f32>,
     pub min_speakers: Option<u32>,
     pub max_speakers: Option<u32>,
+    /// Minimum segment duration for embedding extraction (seconds). Default: 1.0.
+    /// Lower values capture short boundary speech but may produce noisier embeddings.
+    pub min_segment_duration: Option<f32>,
+    /// Minimum gap between segments to keep separate (seconds). Default: 0.1.
+    /// Higher values prevent boundary blurring at speaker transitions.
+    pub min_gap_duration: Option<f32>,
 }
 
 impl Default for DiarizationConfig {
@@ -96,6 +102,8 @@ impl Default for DiarizationConfig {
             clustering_threshold: Some(0.7),
             min_speakers: None,
             max_speakers: None,
+            min_segment_duration: None,
+            min_gap_duration: None,
         }
     }
 }
@@ -245,19 +253,17 @@ impl FluidAudio {
         samples: &[f32],
         config: DiarizationConfig,
     ) -> Result<DiarizationResult, FluidAudioError> {
-        let threshold = config.clustering_threshold.unwrap_or(-1.0);
-        let min_speakers = config
-            .min_speakers
-            .map(|v| v as i32)
-            .unwrap_or(-1);
-        let max_speakers = config
-            .max_speakers
-            .map(|v| v as i32)
-            .unwrap_or(-1);
+        let config_json = serde_json::json!({
+            "clusteringThreshold": config.clustering_threshold.unwrap_or(0.7),
+            "minSpeakers": config.min_speakers.map(|v| v as i32).unwrap_or(-1),
+            "maxSpeakers": config.max_speakers.map(|v| v as i32).unwrap_or(-1),
+            "minSegmentDuration": config.min_segment_duration.unwrap_or(1.0),
+            "minGapDuration": config.min_gap_duration.unwrap_or(0.1),
+        });
 
         let json = self
             .bridge
-            .diarize_samples_with_config(samples, threshold, min_speakers, max_speakers)
+            .diarize_samples_with_config(samples, &config_json.to_string())
             .map_err(FluidAudioError::from)?;
 
         if json.is_empty() {

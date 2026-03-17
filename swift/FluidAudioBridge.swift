@@ -186,23 +186,29 @@ class FluidAudioBridgeInternal {
         return try serializeDiarizationResult(r)
     }
 
-    func diarizeSamplesWithConfig(
+    func diarizeSamplesWithJsonConfig(
         _ samples: [Float],
-        clusteringThreshold: Float,
-        minSpeakers: Int32,
-        maxSpeakers: Int32
+        configJson: String
     ) throws -> String {
         var config = OfflineDiarizerConfig()
-        if clusteringThreshold >= 0 {
-            config.clustering.threshold = Double(clusteringThreshold)
-        } else {
-            config.clustering.threshold = 0.7
-        }
-        if minSpeakers >= 0 {
-            config.clustering.minSpeakers = Int(minSpeakers)
-        }
-        if maxSpeakers >= 0 {
-            config.clustering.maxSpeakers = Int(maxSpeakers)
+
+        if let data = configJson.data(using: .utf8),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            if let threshold = json["clusteringThreshold"] as? Double {
+                config.clustering.threshold = threshold
+            }
+            if let minSpeakers = json["minSpeakers"] as? Int, minSpeakers >= 0 {
+                config.clustering.minSpeakers = minSpeakers
+            }
+            if let maxSpeakers = json["maxSpeakers"] as? Int, maxSpeakers >= 0 {
+                config.clustering.maxSpeakers = maxSpeakers
+            }
+            if let minSegDur = json["minSegmentDuration"] as? Double {
+                config.embedding.minSegmentDurationSeconds = minSegDur
+            }
+            if let minGapDur = json["minGapDuration"] as? Double {
+                config.postProcessing.minGapDurationSeconds = minGapDur
+            }
         }
 
         let manager = OfflineDiarizerManager(config: config)
@@ -648,23 +654,17 @@ public func fluidaudio_diarize_samples_with_config(
     _ ptr: UnsafeMutableRawPointer?,
     _ samples: UnsafePointer<Float>?,
     _ samplesLen: Int,
-    _ clusteringThreshold: Float,
-    _ minSpeakers: Int32,
-    _ maxSpeakers: Int32,
+    _ configJson: UnsafePointer<CChar>?,
     _ outSegmentsJson: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
 ) -> Int32 {
-    guard let ptr = ptr, let samples = samples, samplesLen > 0 else { return -1 }
+    guard let ptr = ptr, let samples = samples, samplesLen > 0, let configJson = configJson else { return -1 }
     let bridge = Unmanaged<FluidAudioBridgeInternal>.fromOpaque(ptr).takeUnretainedValue()
 
     let audioSamples = Array(UnsafeBufferPointer(start: samples, count: samplesLen))
+    let configString = String(cString: configJson)
 
     do {
-        let json = try bridge.diarizeSamplesWithConfig(
-            audioSamples,
-            clusteringThreshold: clusteringThreshold,
-            minSpeakers: minSpeakers,
-            maxSpeakers: maxSpeakers
-        )
+        let json = try bridge.diarizeSamplesWithJsonConfig(audioSamples, configJson: configString)
         outSegmentsJson?.pointee = strdup(json)
         return 0
     } catch {

@@ -51,9 +51,7 @@ extern "C" {
         bridge: *mut std::ffi::c_void,
         samples: *const f32,
         samples_len: isize,
-        clustering_threshold: f32,
-        min_speakers: i32,
-        max_speakers: i32,
+        config_json: *const i8,
         out_segments_json: *mut *mut i8,
     ) -> i32;
     fn fluidaudio_is_diarizer_available(bridge: *mut std::ffi::c_void) -> i32;
@@ -230,10 +228,10 @@ impl FluidAudioBridge {
     pub fn diarize_samples_with_config(
         &self,
         samples: &[f32],
-        clustering_threshold: f32,
-        min_speakers: i32,
-        max_speakers: i32,
+        config_json: &str,
     ) -> Result<String, String> {
+        let config_cstr =
+            std::ffi::CString::new(config_json).map_err(|e| format!("invalid config JSON: {e}"))?;
         let mut segments_json_ptr: *mut i8 = std::ptr::null_mut();
 
         let result = unsafe {
@@ -241,9 +239,7 @@ impl FluidAudioBridge {
                 self.ptr,
                 samples.as_ptr(),
                 samples.len() as isize,
-                clustering_threshold,
-                min_speakers,
-                max_speakers,
+                config_cstr.as_ptr(),
                 &mut segments_json_ptr,
             )
         };
