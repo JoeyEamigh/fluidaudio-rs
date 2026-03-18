@@ -209,6 +209,9 @@ class FluidAudioBridgeInternal {
             if let minGapDur = json["minGapDuration"] as? Double {
                 config.postProcessing.minGapDurationSeconds = minGapDur
             }
+            if let stepRatio = json["segmentationStepRatio"] as? Double {
+                config.segmentation.stepRatio = stepRatio
+            }
         }
 
         let manager = OfflineDiarizerManager(config: config)

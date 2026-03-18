@@ -94,6 +94,10 @@ pub struct DiarizationConfig {
     /// Minimum gap between segments to keep separate (seconds). Default: 0.1.
     /// Higher values prevent boundary blurring at speaker transitions.
     pub min_gap_duration: Option<f32>,
+    /// Segmentation sliding window step ratio (0.0-1.0). Default: 0.2 (community).
+    /// Higher values process fewer windows → faster diarization at slight DER cost.
+    /// 0.2 = 80% overlap (2800 windows for 93min), 0.4 = 60% overlap (~1400 windows).
+    pub segmentation_step_ratio: Option<f64>,
 }
 
 impl Default for DiarizationConfig {
@@ -104,6 +108,7 @@ impl Default for DiarizationConfig {
             max_speakers: None,
             min_segment_duration: None,
             min_gap_duration: None,
+            segmentation_step_ratio: None,
         }
     }
 }
@@ -253,13 +258,17 @@ impl FluidAudio {
         samples: &[f32],
         config: DiarizationConfig,
     ) -> Result<DiarizationResult, FluidAudioError> {
-        let config_json = serde_json::json!({
+        let mut config_map = serde_json::json!({
             "clusteringThreshold": config.clustering_threshold.unwrap_or(0.7),
             "minSpeakers": config.min_speakers.map(|v| v as i32).unwrap_or(-1),
             "maxSpeakers": config.max_speakers.map(|v| v as i32).unwrap_or(-1),
             "minSegmentDuration": config.min_segment_duration.unwrap_or(1.0),
             "minGapDuration": config.min_gap_duration.unwrap_or(0.1),
         });
+        if let Some(step_ratio) = config.segmentation_step_ratio {
+            config_map["segmentationStepRatio"] = serde_json::json!(step_ratio);
+        }
+        let config_json = config_map;
 
         let json = self
             .bridge
