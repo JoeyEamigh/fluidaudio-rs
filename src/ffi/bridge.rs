@@ -46,13 +46,21 @@ extern "C" {
     fn fluidaudio_is_apple_silicon() -> i32;
 
     // Diarization
-    fn fluidaudio_initialize_diarizer(bridge: *mut std::ffi::c_void) -> i32;
+    fn fluidaudio_initialize_diarizer(bridge: *mut std::ffi::c_void, out_error: *mut *mut i8) -> i32;
+    fn fluidaudio_diarize_samples(
+        bridge: *mut std::ffi::c_void,
+        samples: *const f32,
+        samples_len: isize,
+        out_segments_json: *mut *mut i8,
+        out_error: *mut *mut i8,
+    ) -> i32;
     fn fluidaudio_diarize_samples_with_config(
         bridge: *mut std::ffi::c_void,
         samples: *const f32,
         samples_len: isize,
         config_json: *const i8,
         out_segments_json: *mut *mut i8,
+        out_error: *mut *mut i8,
     ) -> i32;
     fn fluidaudio_is_diarizer_available(bridge: *mut std::ffi::c_void) -> i32;
 
@@ -217,12 +225,37 @@ impl FluidAudioBridge {
     }
 
     pub fn initialize_diarizer(&self) -> Result<(), String> {
-        let result = unsafe { fluidaudio_initialize_diarizer(self.ptr) };
+        let mut error_ptr: *mut i8 = std::ptr::null_mut();
+        let result = unsafe { fluidaudio_initialize_diarizer(self.ptr, &mut error_ptr) };
         if result == 0 {
             Ok(())
         } else {
-            Err("Failed to initialize diarizer".to_string())
+            let msg = unsafe { take_c_string(error_ptr) };
+            Err(if msg.is_empty() { "Failed to initialize diarizer".to_string() } else { msg })
         }
+    }
+
+    pub fn diarize_samples(&self, samples: &[f32]) -> Result<String, String> {
+        let mut segments_json_ptr: *mut i8 = std::ptr::null_mut();
+        let mut error_ptr: *mut i8 = std::ptr::null_mut();
+
+        let result = unsafe {
+            fluidaudio_diarize_samples(
+                self.ptr,
+                samples.as_ptr(),
+                samples.len() as isize,
+                &mut segments_json_ptr,
+                &mut error_ptr,
+            )
+        };
+
+        if result != 0 {
+            let msg = unsafe { take_c_string(error_ptr) };
+            return Err(if msg.is_empty() { "Diarization failed".to_string() } else { msg });
+        }
+
+        let json = unsafe { take_c_string(segments_json_ptr) };
+        Ok(json)
     }
 
     pub fn diarize_samples_with_config(
@@ -233,6 +266,7 @@ impl FluidAudioBridge {
         let config_cstr =
             std::ffi::CString::new(config_json).map_err(|e| format!("invalid config JSON: {e}"))?;
         let mut segments_json_ptr: *mut i8 = std::ptr::null_mut();
+        let mut error_ptr: *mut i8 = std::ptr::null_mut();
 
         let result = unsafe {
             fluidaudio_diarize_samples_with_config(
@@ -241,11 +275,13 @@ impl FluidAudioBridge {
                 samples.len() as isize,
                 config_cstr.as_ptr(),
                 &mut segments_json_ptr,
+                &mut error_ptr,
             )
         };
 
         if result != 0 {
-            return Err("Diarization with config failed".to_string());
+            let msg = unsafe { take_c_string(error_ptr) };
+            return Err(if msg.is_empty() { "Diarization with config failed".to_string() } else { msg });
         }
 
         let json = unsafe { take_c_string(segments_json_ptr) };

@@ -138,7 +138,7 @@ class FluidAudioBridgeInternal {
 
         Task {
             do {
-                let config = OfflineDiarizerConfig(clusteringThreshold: 0.7)
+                let config = OfflineDiarizerConfig(clusteringThreshold: 0.7, segmentationStepRatio: 0.4)
                 let manager = OfflineDiarizerManager(config: config)
                 try await manager.prepareModels()
                 self.diarizerManager = manager
@@ -618,14 +618,17 @@ public func fluidaudio_is_apple_silicon() -> Int32 {
 // MARK: - Diarization FFI
 
 @_cdecl("fluidaudio_initialize_diarizer")
-public func fluidaudio_initialize_diarizer(_ ptr: UnsafeMutableRawPointer?) -> Int32 {
+public func fluidaudio_initialize_diarizer(
+    _ ptr: UnsafeMutableRawPointer?,
+    _ outError: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> Int32 {
     guard let ptr = ptr else { return -1 }
     let bridge = Unmanaged<FluidAudioBridgeInternal>.fromOpaque(ptr).takeUnretainedValue()
     do {
         try bridge.initializeDiarizer()
         return 0
     } catch {
-        print("Diarizer init error: \(error)")
+        outError?.pointee = strdup("\(error)")
         return -1
     }
 }
@@ -635,7 +638,8 @@ public func fluidaudio_diarize_samples(
     _ ptr: UnsafeMutableRawPointer?,
     _ samples: UnsafePointer<Float>?,
     _ samplesLen: Int,
-    _ outSegmentsJson: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+    _ outSegmentsJson: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?,
+    _ outError: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
 ) -> Int32 {
     guard let ptr = ptr, let samples = samples, samplesLen > 0 else { return -1 }
     let bridge = Unmanaged<FluidAudioBridgeInternal>.fromOpaque(ptr).takeUnretainedValue()
@@ -647,7 +651,7 @@ public func fluidaudio_diarize_samples(
         outSegmentsJson?.pointee = strdup(json)
         return 0
     } catch {
-        print("Diarize error: \(error)")
+        outError?.pointee = strdup("\(error)")
         return -1
     }
 }
@@ -658,7 +662,8 @@ public func fluidaudio_diarize_samples_with_config(
     _ samples: UnsafePointer<Float>?,
     _ samplesLen: Int,
     _ configJson: UnsafePointer<CChar>?,
-    _ outSegmentsJson: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+    _ outSegmentsJson: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?,
+    _ outError: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
 ) -> Int32 {
     guard let ptr = ptr, let samples = samples, samplesLen > 0, let configJson = configJson else { return -1 }
     let bridge = Unmanaged<FluidAudioBridgeInternal>.fromOpaque(ptr).takeUnretainedValue()
@@ -671,7 +676,7 @@ public func fluidaudio_diarize_samples_with_config(
         outSegmentsJson?.pointee = strdup(json)
         return 0
     } catch {
-        print("Diarize with config error: \(error)")
+        outError?.pointee = strdup("\(error)")
         return -1
     }
 }

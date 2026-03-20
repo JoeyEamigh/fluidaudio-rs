@@ -236,17 +236,33 @@ impl FluidAudio {
             .map_err(FluidAudioError::from)
     }
 
-    /// Diarize raw f32 PCM audio samples (16kHz mono)
+    /// Diarize raw f32 PCM audio samples (16kHz mono) using the pre-initialized
+    /// diarizer manager.
     ///
-    /// Returns a `DiarizationResult` with segments (each with speaker ID and time
-    /// range). When the `embedding` feature is enabled, per-segment embeddings and
-    /// a speaker-to-centroid database are also included.
-    /// Uses default config (clustering threshold 0.7).
+    /// The manager's config (clustering threshold, step ratio, etc.) is set during
+    /// `init_diarizer()`. This avoids creating a throwaway manager per call.
     pub fn diarize_samples(
         &self,
         samples: &[f32],
     ) -> Result<DiarizationResult, FluidAudioError> {
-        self.diarize_samples_with_config(samples, DiarizationConfig::default())
+        let json = self
+            .bridge
+            .diarize_samples(samples)
+            .map_err(FluidAudioError::from)?;
+
+        if json.is_empty() {
+            return Ok(DiarizationResult {
+                segments: Vec::new(),
+                speaker_embeddings: None,
+                posteriors: None,
+                posteriors_num_frames: None,
+                posteriors_num_speakers: None,
+                posteriors_frame_duration: None,
+                posteriors_speaker_ids: None,
+            });
+        }
+
+        parse_diarization_json(&json)
     }
 
     /// Diarize raw f32 PCM audio samples with explicit configuration.
